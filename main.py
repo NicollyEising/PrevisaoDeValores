@@ -1,10 +1,11 @@
-import numpy as np
+import numpy as np 
 import pandas as pd
 import yfinance as yf
-import matplotlib.pyplot as plt
 
 from sklearn.preprocessing import MinMaxScaler, RobustScaler
 from sklearn.model_selection import train_test_split
+from sklearn.multioutput import MultiOutputRegressor
+from xgboost import XGBRegressor
 
 import torch
 import torch.nn as nn
@@ -15,7 +16,6 @@ import logging
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
 
 def compute_rsi(series, period=14):
     delta = series.diff()
@@ -66,7 +66,6 @@ def add_technical_indicators(df):
     df.dropna(inplace=True)
     return df
 
-
 class LSTMDataset(Dataset):
     def __init__(self, features, targets, time_steps=30):
         self.X, self.y = self._create_sequences(features, targets, time_steps)
@@ -88,8 +87,7 @@ class LSTMDataset(Dataset):
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size=128, num_layers=3, output_size=3, dropout=0.2):
         super().__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
-                            batch_first=True, dropout=dropout)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
         self.norm = nn.LayerNorm(hidden_size)
         self.dropout = nn.Dropout(dropout)
         self.fc = nn.Linear(hidden_size, output_size)
@@ -111,7 +109,7 @@ def mape(y_true, y_pred):
     return np.array(out)
 
 def prepare_data():
-    df = yf.download("BTC-USD", start="2015-01-01", end="2025-06-15", auto_adjust=True)
+    df = yf.download("BTC-USD", start="2015-01-01", end="2025-06-25", auto_adjust=True)
     df = add_technical_indicators(df)
     targets = df[['Close','High','Low']].shift(-1)
     df.dropna(inplace=True)
@@ -125,16 +123,13 @@ def prepare_data():
     X_scaled = scaler_X.fit_transform(X)
     y_scaled = scaler_y.fit_transform(y)
 
-    X_trainval, X_test, y_trainval, y_test = train_test_split(
-        X_scaled, y_scaled, test_size=0.2, shuffle=False)
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_trainval, y_trainval, test_size=0.1, shuffle=False)
+    X_trainval, X_test, y_trainval, y_test = train_test_split(X_scaled, y_scaled, test_size=0.2, shuffle=False)
+    X_train, X_val, y_train, y_val = train_test_split(X_trainval, y_trainval, test_size=0.1, shuffle=False)
 
     logging.info(f"Shapes — X_train: {X_train.shape}, X_val: {X_val.shape}, X_test: {X_test.shape}")
     return X_train, X_val, X_test, y_train, y_val, y_test, scaler_X, scaler_y, df
 
-def train_lstm(X_train, y_train, X_val, y_val, time_steps=30,
-               epochs=100, batch_size=32, device=None):
+def train_lstm(X_train, y_train, X_val, y_val, time_steps=30, epochs=100, batch_size=32, device=None):
     ds_train = LSTMDataset(X_train, y_train, time_steps)
     ds_val   = LSTMDataset(X_val,   y_val,   time_steps)
     loader_train = DataLoader(ds_train, batch_size=batch_size, shuffle=True)
@@ -144,7 +139,6 @@ def train_lstm(X_train, y_train, X_val, y_val, time_steps=30,
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    #Treinamento com MSE 
     criterion = nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
@@ -194,34 +188,49 @@ def predict_lstm(model, X, scaler_y, time_steps=30, device=None):
             preds.append(model(xb).cpu().numpy())
     return scaler_y.inverse_transform(np.vstack(preds))
 
+def train_xgb(X_trainval, y_trainval, X_test):
+    xgb = MultiOutputRegressor(XGBRegressor(
+        n_estimators=300, learning_rate=0.02, max_depth=6,
+        subsample=0.8, colsample_bytree=0.8,
+        reg_alpha=0.5, reg_lambda=1,
+        random_state=42, verbosity=0
+    ))
+    xgb.fit(X_trainval, y_trainval)
+    return xgb, xgb.predict(X_test)
+
 def main():
     X_train, X_val, X_test, y_train, y_val, y_test, scaler_X, scaler_y, df = prepare_data()
 
     lstm_model, device = train_lstm(X_train, y_train, X_val, y_val)
     lstm_preds = predict_lstm(lstm_model, np.vstack([X_val, X_test]), scaler_y)
-
     y_true_comb = scaler_y.inverse_transform(np.vstack([y_val, y_test]))
 
-    n = min(len(lstm_preds), len(y_true_comb))
-    lstm_preds, y_true = lstm_preds[-n:], y_true_comb[-n:]
+    xgb_model, xgb_preds = train_xgb(np.vstack([X_train, X_val]), np.vstack([y_train, y_val]), np.vstack([X_val, X_test]))
+    xgb_preds = scaler_y.inverse_transform(xgb_preds)
 
-    errs = mape(y_true, lstm_preds)
-    logging.info(f"LSTM     | Close: {errs[0]:5.2f}% | High: {errs[1]:5.2f}% | Low: {errs[2]:5.2f}%")
+    n = min(len(lstm_preds), len(xgb_preds), len(y_true_comb))
+    lstm_preds, xgb_preds, y_true = lstm_preds[-n:], xgb_preds[-n:], y_true_comb[-n:]
+
+    for name, pred in zip(['LSTM','XGBoost'], [lstm_preds, xgb_preds]):
+        errs = mape(y_true, pred)
+        logging.info(f"{name:8s} | Close: {errs[0]:5.2f}% | High: {errs[1]:5.2f}% | Low: {errs[2]:5.2f}%")
 
     time_steps = 30
     full_X = np.vstack([X_val, X_test])
     last_window = full_X[-time_steps:]
 
     with torch.no_grad():
-        lstm_input = torch.tensor(last_window.reshape(1, time_steps, -1),
-                                  dtype=torch.float32).to(device)
+        lstm_input = torch.tensor(last_window.reshape(1, time_steps, -1), dtype=torch.float32).to(device)
         next_lstm_scaled = lstm_model(lstm_input).cpu().numpy()
     next_lstm = scaler_y.inverse_transform(next_lstm_scaled)
 
-    print(f"Previsão para o próximo dia (LSTM):")
-    print(f"  Close: {next_lstm[0][0]:.2f}")
-    print(f"  High : {next_lstm[0][1]:.2f}")
-    print(f"  Low  : {next_lstm[0][2]:.2f}")
+    last_feat = last_window[-1].reshape(1, -1)
+    next_xgb_scaled = xgb_model.predict(last_feat)
+    next_xgb = scaler_y.inverse_transform(next_xgb_scaled)
+
+    print(f"Previsão para o próximo dia:")
+    print(f"  LSTM    -> Close: {next_lstm[0][0]:.2f}, High: {next_lstm[0][1]:.2f}, Low: {next_lstm[0][2]:.2f}")
+    print(f"  XGBoost -> Close: {next_xgb[0][0]:.2f}, High: {next_xgb[0][1]:.2f}, Low: {next_xgb[0][2]:.2f}")
 
 if __name__ == "__main__":
     main()
