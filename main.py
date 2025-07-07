@@ -1,21 +1,21 @@
-import numpy as np 
+import numpy as np
 import pandas as pd
 import yfinance as yf
-
+import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler, RobustScaler
 from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.multioutput import MultiOutputRegressor
 from xgboost import XGBRegressor
-
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
-
 import warnings
 import logging
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 def compute_rsi(series, period=14):
     delta = series.diff()
@@ -66,6 +66,7 @@ def add_technical_indicators(df):
     df.dropna(inplace=True)
     return df
 
+
 class LSTMDataset(Dataset):
     def __init__(self, features, targets, time_steps=30):
         self.X, self.y = self._create_sequences(features, targets, time_steps)
@@ -87,7 +88,8 @@ class LSTMDataset(Dataset):
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size=128, num_layers=3, output_size=3, dropout=0.2):
         super().__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
+                            batch_first=True, dropout=dropout)
         self.norm = nn.LayerNorm(hidden_size)
         self.dropout = nn.Dropout(dropout)
         self.fc = nn.Linear(hidden_size, output_size)
@@ -99,14 +101,10 @@ class LSTMModel(nn.Module):
         h = self.dropout(h)
         return self.fc(h)
 
+
 def mape(y_true, y_pred):
-    out = []
-    for i in range(y_true.shape[1]):
-        yt = y_true[:, i]
-        yp = y_pred[:, i]
-        mask = ~np.isnan(yt) & (yt != 0)
-        out.append(np.mean(np.abs((yt[mask] - yp[mask]) / yt[mask])) * 100)
-    return np.array(out)
+    return np.mean(np.abs((y_true - y_pred) /
+               np.where(y_true == 0, np.nan, y_true)), axis=0) * 100
 
 def prepare_data():
     df = yf.download("BTC-USD", start="2015-01-01", end="2025-06-25", auto_adjust=True)
@@ -123,13 +121,16 @@ def prepare_data():
     X_scaled = scaler_X.fit_transform(X)
     y_scaled = scaler_y.fit_transform(y)
 
-    X_trainval, X_test, y_trainval, y_test = train_test_split(X_scaled, y_scaled, test_size=0.2, shuffle=False)
-    X_train, X_val, y_train, y_val = train_test_split(X_trainval, y_trainval, test_size=0.1, shuffle=False)
+    X_trainval, X_test, y_trainval, y_test = train_test_split(
+        X_scaled, y_scaled, test_size=0.2, shuffle=False)
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_trainval, y_trainval, test_size=0.1, shuffle=False)
 
     logging.info(f"Shapes — X_train: {X_train.shape}, X_val: {X_val.shape}, X_test: {X_test.shape}")
     return X_train, X_val, X_test, y_train, y_val, y_test, scaler_X, scaler_y, df
 
-def train_lstm(X_train, y_train, X_val, y_val, time_steps=30, epochs=100, batch_size=32, device=None):
+def train_lstm(X_train, y_train, X_val, y_val, time_steps=30,
+               epochs=100, batch_size=32, device=None):
     ds_train = LSTMDataset(X_train, y_train, time_steps)
     ds_val   = LSTMDataset(X_val,   y_val,   time_steps)
     loader_train = DataLoader(ds_train, batch_size=batch_size, shuffle=True)
@@ -203,34 +204,82 @@ def main():
 
     lstm_model, device = train_lstm(X_train, y_train, X_val, y_val)
     lstm_preds = predict_lstm(lstm_model, np.vstack([X_val, X_test]), scaler_y)
+
     y_true_comb = scaler_y.inverse_transform(np.vstack([y_val, y_test]))
 
-    xgb_model, xgb_preds = train_xgb(np.vstack([X_train, X_val]), np.vstack([y_train, y_val]), np.vstack([X_val, X_test]))
+    xgb_model, xgb_preds = train_xgb(
+        np.vstack([X_train, X_val]), np.vstack([y_train, y_val]),
+        np.vstack([X_val, X_test])
+    )
     xgb_preds = scaler_y.inverse_transform(xgb_preds)
 
+    # alinhar comprimentos
     n = min(len(lstm_preds), len(xgb_preds), len(y_true_comb))
-    lstm_preds, xgb_preds, y_true = lstm_preds[-n:], xgb_preds[-n:], y_true_comb[-n:]
+    lstm_preds, xgb_preds, y_true = (
+        lstm_preds[-n:], xgb_preds[-n:], y_true_comb[-n:]
+    )
 
-    for name, pred in zip(['LSTM','XGBoost'], [lstm_preds, xgb_preds]):
-        errs = mape(y_true, pred)
-        logging.info(f"{name:8s} | Close: {errs[0]:5.2f}% | High: {errs[1]:5.2f}% | Low: {errs[2]:5.2f}%")
+    # filtrar linhas com NaN em meta_X ou y_true
+    meta_X = np.hstack([lstm_preds, xgb_preds])
+    mask = ~np.isnan(meta_X).any(axis=1) & ~np.isnan(y_true).any(axis=1)
+    meta_X_clean, y_clean = meta_X[mask], y_true[mask]
 
-    time_steps = 30
+    # ensemble com RandomForest
+    meta = RandomForestRegressor(n_estimators=100, random_state=42)
+    meta.fit(meta_X_clean, y_clean)
+
+    ensemble = meta.predict(meta_X_clean)
+
+
+    for name, pred in zip(['LSTM','XGBoost','Ensemble'], 
+                          [lstm_preds[mask], xgb_preds[mask], ensemble]):
+        errs = mape(y_clean, pred)
+        logging.info(f"{name:8s} | Close: {errs[0]:5.2f}% | "
+                     f"High: {errs[1]:5.2f}% | Low: {errs[2]:5.2f}%")
+        
+
+    time_steps = 30  
+
     full_X = np.vstack([X_val, X_test])
-    last_window = full_X[-time_steps:]
+    last_window = full_X[-time_steps:]  
 
+    # Previsão LSTM
     with torch.no_grad():
-        lstm_input = torch.tensor(last_window.reshape(1, time_steps, -1), dtype=torch.float32).to(device)
+        lstm_input = torch.tensor(last_window.reshape(1, time_steps, -1),
+                                  dtype=torch.float32).to(device)
         next_lstm_scaled = lstm_model(lstm_input).cpu().numpy()
     next_lstm = scaler_y.inverse_transform(next_lstm_scaled)
 
+    # Previsão XGBoost
     last_feat = last_window[-1].reshape(1, -1)
     next_xgb_scaled = xgb_model.predict(last_feat)
     next_xgb = scaler_y.inverse_transform(next_xgb_scaled)
 
+    # Combinação Ensemble
+    next_meta_input = np.hstack([next_lstm, next_xgb])
+    next_pred = meta.predict(next_meta_input).flatten()
+
+    # Exibição
     print(f"Previsão para o próximo dia:")
-    print(f"  LSTM    -> Close: {next_lstm[0][0]:.2f}, High: {next_lstm[0][1]:.2f}, Low: {next_lstm[0][2]:.2f}")
-    print(f"  XGBoost -> Close: {next_xgb[0][0]:.2f}, High: {next_xgb[0][1]:.2f}, Low: {next_xgb[0][2]:.2f}")
+    print(f"  Close: {next_pred[0]:.2f}")
+    print(f"  High : {next_pred[1]:.2f}")
+    print(f"  Low  : {next_pred[2]:.2f}")
+
+
+    # plotagem
+    dates = df.index[-len(y_clean):]
+    plt.figure(figsize=(12,6))
+    plt.plot(dates, y_clean[:,0], label='Real - Close', linewidth=2)
+    plt.plot(dates, lstm_preds[mask,0], '--', label='LSTM - Close')
+    plt.plot(dates, xgb_preds[mask,0], '--', label='XGB - Close')
+    plt.plot(dates, ensemble[:,0], '--', label='Ensemble - Close')
+    plt.title("Previsões vs Real – Preço de Fechamento")
+    plt.xlabel("Data")
+    plt.ylabel("Preço")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
 
 if __name__ == "__main__":
     main()
