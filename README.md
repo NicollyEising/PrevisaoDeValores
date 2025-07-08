@@ -6,6 +6,10 @@ Este projeto implementa um sistema de previsão diária do índice Bovespa (^BVS
   - XGBoost (Extreme Gradient Boosting)
   - Ensemble com RandomForest em meta-features
 
+## Integrantes
+Nahuel Isaias Ayala Molinas e Nicolly Munhoz Eising
+
+
 ## Trello
 [Acesse o quadro do Trello aqui](https://trello.com/b/VjS7WFgy/previsaodevalores)
 
