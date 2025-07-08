@@ -8,3 +8,16 @@ Este projeto implementa um sistema de previsão diária do índice Bovespa (^BVS
 
 ## Trello
 [Acesse o quadro do Trello aqui](https://trello.com/b/VjS7WFgy/previsaodevalores)
+
+## Instruções de uso
+
+1. **Rodar o backend**  
+   No diretório raiz do projeto, execute:  
+   ```bash
+   uvicorn api:app --reload
+
+2. **Rodar o frontend**  
+   Navegue até o diretório do frontend e inicie a aplicação:  
+   ```bash
+   cd frontend
+   npm start
